@@ -33,20 +33,33 @@
 #include "commands.h"
 #include "utils.h"
 
-#define OPT_NO_LOCK OPT_USAGE+1
-#define OPT_NO_KILL OPT_USAGE+2
+#define OPT_NO_LOCK OPT_USAGE + 1
+#define OPT_NO_KILL OPT_USAGE + 2
 
 lxc_log_define(lxc_stop_ui, lxc);
 
-static int my_parser(struct lxc_arguments* args, int c, char* arg)
+static int my_parser(struct lxc_arguments *args, int c, char *arg)
 {
 	switch (c) {
-	case 'r': args->reboot = 1; break;
-	case 'W': args->nowait = 1; break;
-	case 't': args->timeout = atoi(arg); break;
-	case 'k': args->hardstop = 1; break;
-	case OPT_NO_LOCK: args->nolock = 1; break;
-	case OPT_NO_KILL: args->nokill = 1; break;
+	case 'r':
+		args->reboot = 1;
+		break;
+	case 'W':
+		args->nowait = 1;
+		break;
+	case 't':
+		if (lxc_safe_long(arg, &args->timeout) < 0)
+			return -1;
+		break;
+	case 'k':
+		args->hardstop = 1;
+		break;
+	case OPT_NO_LOCK:
+		args->nolock = 1;
+		break;
+	case OPT_NO_KILL:
+		args->nokill = 1;
+		break;
 	}
 	return 0;
 }
@@ -75,7 +88,8 @@ Options :\n\
   -t, --timeout=T   wait T seconds before hard-stopping\n\
   -k, --kill        kill container rather than request clean shutdown\n\
       --nolock      Avoid using API locks\n\
-      --nokill      Only request clean shutdown, don't force kill after timeout\n",
+      --nokill      Only request clean shutdown, don't force kill after timeout\n\
+  --rcfile=FILE     Load configuration file FILE\n",
 	.options  = my_longopts,
 	.parser   = my_parser,
 	.checker  = NULL,
@@ -142,65 +156,77 @@ int main(int argc, char *argv[])
 {
 	struct lxc_container *c;
 	bool s;
-	int ret = 1;
+	int ret = EXIT_FAILURE;
 
 	if (lxc_arguments_parse(&my_args, argc, argv))
-		return 1;
+		exit(ret);
 
 	if (lxc_log_init(my_args.name, my_args.log_file, my_args.log_priority,
 			 my_args.progname, my_args.quiet, my_args.lxcpath[0]))
-		return 1;
+		exit(ret);
 	lxc_log_options_no_override();
 
 	/* Set default timeout */
 	if (my_args.timeout == -2) {
-		if (my_args.hardstop) {
+		if (my_args.hardstop)
 			my_args.timeout = 0;
-		}
-		else {
+		else
 			my_args.timeout = 60;
-		}
 	}
 
-	if (my_args.nowait) {
+	if (my_args.nowait)
 		my_args.timeout = 0;
-	}
 
 	/* some checks */
 	if (!my_args.hardstop && my_args.timeout < -1) {
 		fprintf(stderr, "invalid timeout\n");
-		return 1;
+		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.nokill) {
 		fprintf(stderr, "-k can't be used with --nokill\n");
-		return 1;
+		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.reboot) {
 		fprintf(stderr, "-k can't be used with -r\n");
-		return 1;
+		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.timeout) {
 		fprintf(stderr, "-k doesn't allow timeouts\n");
-		return 1;
+		exit(ret);
 	}
 
 	if (my_args.nolock && !my_args.hardstop) {
 		fprintf(stderr, "--nolock may only be used with -k\n");
-		return 1;
+		exit(ret);
 	}
 
 	/* shortcut - if locking is bogus, we should be able to kill
 	 * containers at least */
-	if (my_args.nolock)
-		return lxc_cmd_stop(my_args.name, my_args.lxcpath[0]);
+	if (my_args.nolock) {
+		ret = lxc_cmd_stop(my_args.name, my_args.lxcpath[0]);
+		exit(ret);
+	}
 
 	c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
 	if (!c) {
 		fprintf(stderr, "Error opening container\n");
 		goto out;
+	}
+
+	if (my_args.rcfile) {
+		c->clear_config(c);
+		if (!c->load_config(c, my_args.rcfile)) {
+			fprintf(stderr, "Failed to load rcfile\n");
+			goto out;
+		}
+		c->configfile = strdup(my_args.rcfile);
+		if (!c->configfile) {
+			fprintf(stderr, "Out of memory setting new config filename\n");
+			goto out;
+		}
 	}
 
 	if (!c->may_control(c)) {
@@ -210,19 +236,22 @@ int main(int argc, char *argv[])
 
 	if (!c->is_running(c)) {
 		fprintf(stderr, "%s is not running\n", c->name);
+		/* Per our manpage we need to exit with exit code:
+		 * 2: The specified container exists but was not running.
+		 */
 		ret = 2;
 		goto out;
 	}
 
 	/* kill */
 	if (my_args.hardstop) {
-		ret = c->stop(c) ? 0 : 1;
+		ret = c->stop(c) ? EXIT_SUCCESS : EXIT_FAILURE;
 		goto out;
 	}
 
 	/* reboot */
 	if (my_args.reboot) {
-		ret = do_reboot_and_check(&my_args, c);
+		ret = do_reboot_and_check(&my_args, c) < 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 		goto out;
 	}
 
@@ -230,17 +259,16 @@ int main(int argc, char *argv[])
 	s = c->shutdown(c, my_args.timeout);
 	if (!s) {
 		if (my_args.timeout == 0)
-			ret = 0;
+			ret = EXIT_SUCCESS;
 		else if (my_args.nokill)
-			ret = 1;
+			ret = EXIT_FAILURE;
 		else
-			ret = c->stop(c) ? 0 : 1;
-	} else
-		ret = 0;
+			ret = c->stop(c) ? EXIT_SUCCESS : EXIT_FAILURE;
+	} else {
+		ret = EXIT_SUCCESS;
+	}
 
 out:
 	lxc_container_put(c);
-	if (ret < 0)
-		return 1;
-	return ret;
+	exit(ret);
 }

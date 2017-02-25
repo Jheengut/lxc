@@ -19,7 +19,6 @@
  */
 
 #define _GNU_SOURCE
-#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -60,6 +59,14 @@
 #include "state.h"
 #include "utils.h"
 #include "version.h"
+
+/* major()/minor() */
+#ifdef MAJOR_IN_MKDEV
+#    include <sys/mkdev.h>
+#endif
+#ifdef MAJOR_IN_SYSMACROS
+#    include <sys/sysmacros.h>
+#endif
 
 #if HAVE_IFADDRS_H
 #include <ifaddrs.h>
@@ -623,7 +630,7 @@ WRAP_API_1(bool, wait_on_daemonized_start, int)
 
 static bool am_single_threaded(void)
 {
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	DIR *dir;
 	int count=0;
 
@@ -633,7 +640,7 @@ static bool am_single_threaded(void)
 		return false;
 	}
 
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		if (!direntp)
 			break;
 
@@ -1582,8 +1589,10 @@ static bool do_lxcapi_reboot(struct lxc_container *c)
 		return false;
 	if (c->lxc_conf && c->lxc_conf->rebootsignal)
 		rebootsignal = c->lxc_conf->rebootsignal;
-	if (kill(pid, rebootsignal) < 0)
+	if (kill(pid, rebootsignal) < 0) {
+		WARN("Could not send signal %d to pid %d.", rebootsignal, pid);
 		return false;
+	}
 	return true;
 
 }
@@ -1614,7 +1623,9 @@ static bool do_lxcapi_shutdown(struct lxc_container *c, int timeout)
 
 	INFO("Using signal number '%d' as halt signal.", haltsignal);
 
-	kill(pid, haltsignal);
+	if (kill(pid, haltsignal) < 0)
+		WARN("Could not send signal %d to pid %d.", haltsignal, pid);
+
 	retv = do_lxcapi_wait(c, "STOPPED", timeout);
 	return retv;
 }
@@ -2284,7 +2295,7 @@ out:
 static bool has_snapshots(struct lxc_container *c)
 {
 	char path[MAXPATHLEN];
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	int count=0;
 	DIR *dir;
 
@@ -2293,7 +2304,7 @@ static bool has_snapshots(struct lxc_container *c)
 	dir = opendir(path);
 	if (!dir)
 		return false;
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		if (!direntp)
 			break;
 
@@ -2826,11 +2837,15 @@ bool should_default_to_snapshot(struct lxc_container *c0,
 	size_t l1 = strlen(c1->config_path) + strlen(c1->name) + 2;
 	char *p0 = alloca(l0 + 1);
 	char *p1 = alloca(l1 + 1);
+	char *rootfs = c0->lxc_conf->rootfs.path;
 
 	snprintf(p0, l0, "%s/%s", c0->config_path, c0->name);
 	snprintf(p1, l1, "%s/%s", c1->config_path, c1->name);
 
 	if (!is_btrfs_fs(p0) || !is_btrfs_fs(p1))
+		return false;
+
+	if (is_btrfs_subvol(rootfs) <= 0)
 		return false;
 
 	return btrfs_same_fs(p0, p1) == 0;
@@ -3503,7 +3518,7 @@ static int do_lxcapi_snapshot_list(struct lxc_container *c, struct lxc_snapshot 
 {
 	char snappath[MAXPATHLEN], path2[MAXPATHLEN];
 	int count = 0, ret;
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	struct lxc_snapshot *snaps =NULL, *nsnaps;
 	DIR *dir;
 
@@ -3520,7 +3535,7 @@ static int do_lxcapi_snapshot_list(struct lxc_container *c, struct lxc_snapshot 
 		return 0;
 	}
 
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		if (!direntp)
 			break;
 
@@ -3666,7 +3681,7 @@ err:
 static bool remove_all_snapshots(const char *path)
 {
 	DIR *dir;
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	bool bret = true;
 
 	dir = opendir(path);
@@ -3674,7 +3689,7 @@ static bool remove_all_snapshots(const char *path)
 		SYSERROR("opendir on snapshot path %s", path);
 		return false;
 	}
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		if (!direntp)
 			break;
 		if (!strcmp(direntp->d_name, "."))
@@ -3956,6 +3971,7 @@ static int do_lxcapi_migrate(struct lxc_container *c, unsigned int cmd,
 			     struct migrate_opts *opts, unsigned int size)
 {
 	int ret;
+	struct migrate_opts *valid_opts = opts;
 
 	/* If the caller has a bigger (newer) struct migrate_opts, let's make
 	 * sure that the stuff on the end is zero, i.e. that they didn't ask us
@@ -3974,20 +3990,48 @@ static int do_lxcapi_migrate(struct lxc_container *c, unsigned int cmd,
 		}
 	}
 
+	/* If the caller has a smaller struct, let's zero out the end for them
+	 * so we don't accidentally use bits of it that they didn't know about
+	 * to initialize.
+	 */
+	if (size < sizeof(*opts)) {
+		valid_opts = malloc(sizeof(*opts));
+		if (!valid_opts)
+			return -ENOMEM;
+
+		memset(valid_opts, 0, sizeof(*opts));
+		memcpy(valid_opts, opts, size);
+	}
+
 	switch (cmd) {
 	case MIGRATE_PRE_DUMP:
-		ret = !__criu_pre_dump(c, opts);
+		if (!do_lxcapi_is_running(c)) {
+			ERROR("container is not running");
+			return false;
+		}
+		ret = !__criu_pre_dump(c, valid_opts);
 		break;
 	case MIGRATE_DUMP:
-		ret = !__criu_dump(c, opts);
+		if (!do_lxcapi_is_running(c)) {
+			ERROR("container is not running");
+			return false;
+		}
+		ret = !__criu_dump(c, valid_opts);
 		break;
 	case MIGRATE_RESTORE:
-		ret = !__criu_restore(c, opts);
+		if (do_lxcapi_is_running(c)) {
+			ERROR("container is already running");
+			return false;
+		}
+		ret = !__criu_restore(c, valid_opts);
 		break;
 	default:
 		ERROR("invalid migrate command %u", cmd);
 		ret = -EINVAL;
 	}
+
+	if (size < sizeof(*opts))
+		free(valid_opts);
 
 	return ret;
 }
@@ -4191,7 +4235,7 @@ int list_defined_containers(const char *lxcpath, char ***names, struct lxc_conta
 {
 	DIR *dir;
 	int i, cfound = 0, nfound = 0;
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	struct lxc_container *c;
 
 	if (!lxcpath)
@@ -4208,7 +4252,7 @@ int list_defined_containers(const char *lxcpath, char ***names, struct lxc_conta
 	if (names)
 		*names = NULL;
 
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		if (!direntp)
 			break;
 
@@ -4282,7 +4326,7 @@ int list_active_containers(const char *lxcpath, char ***nret,
 	char *line = NULL;
 	char **ct_name = NULL;
 	size_t len = 0;
-	struct lxc_container *c;
+	struct lxc_container *c = NULL;
 	bool is_hashed;
 
 	if (!lxcpath)
@@ -4365,7 +4409,12 @@ int list_active_containers(const char *lxcpath, char ***nret,
 		cret_cnt++;
 	}
 
-	assert(!nret || !cret || cret_cnt == ct_name_cnt);
+	if (nret && cret && cret_cnt != ct_name_cnt) {
+		if (c)
+			lxc_container_put(c);
+		goto free_cret_list;
+	}
+
 	ret = ct_name_cnt;
 	if (nret)
 		*nret = ct_name;

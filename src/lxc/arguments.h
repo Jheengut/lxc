@@ -61,7 +61,7 @@ struct lxc_arguments {
 	const char *share_ns[32]; // size must be greater than LXC_NS_MAX
 
 	/* for lxc-console */
-	int ttynum;
+	unsigned int ttynum;
 	char escape;
 
 	/* for lxc-wait */
@@ -151,18 +151,18 @@ struct lxc_arguments {
 	{"logfile", required_argument, 0, 'o'}, \
 	{"logpriority", required_argument, 0, 'l'}, \
 	{"lxcpath", required_argument, 0, 'P'}, \
+	{"rcfile", required_argument, 0, OPT_RCFILE}, \
 	{0, 0, 0, 0}
 
 /* option keys for long only options */
 #define	OPT_USAGE 0x1000
 #define	OPT_VERSION OPT_USAGE-1
+#define	OPT_RCFILE OPT_USAGE-2
 
 extern int lxc_arguments_parse(struct lxc_arguments *args,
 			       int argc, char *const argv[]);
 
 extern int lxc_arguments_str_to_int(struct lxc_arguments *args, const char *str);
-
-extern const char *lxc_strerror(int errnum);
 
 #define lxc_error(arg, fmt, args...) if (!(arg)->quiet)			\
 	fprintf(stderr, "%s: " fmt "\n", (arg)->progname,  ## args)

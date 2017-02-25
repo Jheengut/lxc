@@ -123,6 +123,8 @@ parse_arch() {
 	case "$1" in
 		x86 | i[3-6]86) echo 'x86';;
 		x86_64 | amd64) echo 'x86_64';;
+		aarch64 | arm64) echo 'aarch64';;
+		armv7) echo 'armv7';;
 		arm*) echo 'armhf';;
 		*) return 1;;
 	esac
@@ -249,7 +251,7 @@ install() {
 	ln -s "$apk_cache" etc/apk/cache
 	echo "$repo_url" > etc/apk/repositories
 
-	install_packages "$arch" alpine-base $extra_packages
+	install_packages "$arch" "alpine-base $extra_packages"
 	make_dev_nodes
 	setup_inittab
 	setup_hosts
@@ -362,8 +364,12 @@ setup_services() {
 	done
 
 	# default runlevel
-	for svc_name in networking cron; do
-		ln -s /etc/init.d/$svc_name etc/runlevels/default/$svc_name
+	for svc_name in networking cron crond; do
+		# issue 1164: alpine renamed cron to crond
+		# Use the one that exists.
+		if [ -e etc/init.d/$svc_name ]; then
+			ln -s /etc/init.d/$svc_name etc/runlevels/default/$svc_name
+		fi
 	done
 }
 

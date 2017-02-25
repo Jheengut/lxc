@@ -1,6 +1,6 @@
 if ENABLE_TESTS
 
-LDADD = ../lxc/liblxc.so
+LDADD = ../lxc/liblxc.la
 
 lxc_test_containertests_SOURCES = containertests.c
 lxc_test_locktests_SOURCES = locktests.c
@@ -23,6 +23,7 @@ lxc_test_list_SOURCES = list.c
 lxc_test_attach_SOURCES = attach.c
 lxc_test_device_add_remove_SOURCES = device_add_remove.c
 lxc_test_apparmor_SOURCES = aa.c
+lxc_test_utils_SOURCES = lxc-test-utils.c lxctest.h
 
 AM_CFLAGS=-DLXCROOTFSMOUNT=\"$(LXCROOTFSMOUNT)\" \
 	-DLXCPATH=\"$(LXCPATH)\" \
@@ -50,10 +51,13 @@ bin_PROGRAMS = lxc-test-containertests lxc-test-locktests lxc-test-startone \
 	lxc-test-cgpath lxc-test-clonetest lxc-test-console \
 	lxc-test-snapshot lxc-test-concurrent lxc-test-may-control \
 	lxc-test-reboot lxc-test-list lxc-test-attach lxc-test-device-add-remove \
-	lxc-test-apparmor
+	lxc-test-apparmor lxc-test-utils
 
-bin_SCRIPTS = lxc-test-automount lxc-test-autostart lxc-test-cloneconfig \
-	lxc-test-createconfig
+bin_SCRIPTS = lxc-test-automount \
+	      lxc-test-autostart \
+	      lxc-test-cloneconfig \
+	      lxc-test-createconfig \
+	      lxc-test-no-new-privs
 
 if DISTRO_UBUNTU
 bin_SCRIPTS += \
@@ -90,12 +94,17 @@ EXTRA_DIST = \
 	lxc-test-checkpoint-restore \
 	lxc-test-cloneconfig \
 	lxc-test-createconfig \
+	lxc-test-no-new-privs \
 	lxc-test-snapdeps \
 	lxc-test-symlink \
 	lxc-test-ubuntu \
 	lxc-test-unpriv \
+	lxc-test-utils.c \
 	may_control.c \
 	saveconfig.c \
 	shutdowntest.c \
 	snapshot.c \
 	startone.c
+
+clean-local:
+	rm -f lxc-test-utils-*

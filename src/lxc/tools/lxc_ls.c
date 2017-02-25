@@ -43,7 +43,6 @@
 
 lxc_log_define(lxc_ls, lxc);
 
-#define LINELEN 1024
 /* Per default we only allow five levels of recursion to protect the stack at
  * least a little bit. */
 #define MAX_NESTLVL 5
@@ -144,7 +143,7 @@ static void ls_print_fancy_format(struct ls *l, struct lengths *lht,
  * Only print names of containers.
  */
 static void ls_print_names(struct ls *l, struct lengths *lht,
-		size_t ls_arr, size_t termwidth);
+		size_t ls_arr, size_t termwidth, bool list);
 
 /*
  * Print default fancy format.
@@ -184,9 +183,11 @@ static struct lxc_arguments my_args = {
 lxc-ls list containers\n\
 \n\
 Options :\n\
-  -1, --line	     show one entry per line\n\
-  -f, --fancy	     column-based output\n\
-  -F, --fancy-format column-based output\n\
+  -1, --line         show one entry per line\n\
+  -f, --fancy        use a fancy, column-based output\n\
+  -F, --fancy-format comma separated list of columns to show in the fancy output\n\
+                     valid columns are: NAME, STATE, PID, RAM, SWAP, AUTOSTART,\n\
+                     GROUPS, INTERFACE, IPV4 and IPV6\n\
   --active           list only active containers\n\
   --running          list only running containers\n\
   --frozen           list only frozen containers\n\
@@ -264,7 +265,7 @@ int main(int argc, char *argv[])
 		unsigned int cols = 0;
 		if (!my_args.ls_line)
 			cols = ls_get_term_width();
-		ls_print_names(ls_arr, &max_len, ls_size, cols);
+		ls_print_names(ls_arr, &max_len, ls_size, cols, my_args.ls_line);
 	}
 
 	ret = EXIT_SUCCESS;
@@ -457,8 +458,14 @@ static int ls_get(struct ls **m, size_t *size, const struct lxc_arguments *args,
 				goto put_and_next;
 
 			tmp = ls_get_config_item(c, "lxc.start.auto", running);
-			if (tmp)
-				l->autostart = atoi(tmp);
+			if (tmp) {
+				unsigned int astart = 0;
+				if (lxc_safe_uint(tmp, &astart) < 0)
+					WARN("Could not parse value for 'lxc.start.auto'.");
+				if (astart > 1)
+					DEBUG("Wrong value for 'lxc.start.auto = %d'.", astart);
+				l->autostart = astart == 1 ? true : false;
+			}
 			free(tmp);
 
 			if (running) {
@@ -743,7 +750,7 @@ static struct ls *ls_new(struct ls **ls, size_t *size)
 }
 
 static void ls_print_names(struct ls *l, struct lengths *lht,
-		size_t size, size_t termwidth)
+		size_t size, size_t termwidth, bool list)
 {
 	/* If list is empty do nothing. */
 	if (size == 0)
@@ -752,14 +759,18 @@ static void ls_print_names(struct ls *l, struct lengths *lht,
 	size_t i, len = 0;
 	struct ls *m = NULL;
 	for (i = 0, m = l; i < size; i++, m++) {
-		printf("%-*s", lht->name_length, m->name ? m->name : "-");
-		len += lht->name_length;
-		if ((len + lht->name_length) >= termwidth) {
-			printf("\n");
-			len = 0;
+		if (list) {
+			printf("%s\n", m->name ? m->name : "-");
 		} else {
-			printf(" ");
-			len++;
+			printf("%-*s", lht->name_length, m->name ? m->name : "-");
+			len += lht->name_length;
+			if ((len + lht->name_length) >= termwidth) {
+				printf("\n");
+				len = 0;
+			} else {
+				printf(" ");
+				len++;
+			}
 		}
 	}
 	if (len > 0)
@@ -986,25 +997,40 @@ out:
 static int ls_remove_lock(const char *path, const char *name,
 		char **lockpath, size_t *len_lockpath, bool recalc)
 {
+	int ret = -1;
+	char *rundir;
+
+	/* lockfile will be:
+	 * "/run" + "/lxc/lock/$lxcpath/$lxcname + '\0' if root
+	 * or
+	 * $XDG_RUNTIME_DIR + "/lxc/lock/$lxcpath/$lxcname + '\0' if non-root
+	 */
+	rundir = get_rundir();
+	if (!rundir)
+		goto out;
+
 	/* Avoid doing unnecessary work if we can. */
 	if (recalc) {
-		size_t newlen = strlen(path) + strlen(name) + strlen(RUNTIME_PATH) + /* / + lxc + / + lock + / + / = */ 11 + 1;
+		size_t newlen = strlen(path) + strlen(name) + strlen(rundir) + /* / + lxc + / + lock + / + / = */ 11 + 1;
 		if (newlen > *len_lockpath) {
 			char *tmp = realloc(*lockpath, newlen * 2);
 			if (!tmp)
-				return -1;
+				goto out;
 			*lockpath = tmp;
 			*len_lockpath = newlen * 2;
 		}
 	}
 
-	int check = snprintf(*lockpath, *len_lockpath, "%s/lxc/lock/%s/%s", RUNTIME_PATH, path, name);
+	int check = snprintf(*lockpath, *len_lockpath, "%s/lxc/lock/%s/%s", rundir, path, name);
 	if (check < 0 || (size_t)check >= *len_lockpath)
-		return -1;
+		goto out;
 
 	lxc_rmdir_onedev(*lockpath, NULL);
+	ret = 0;
 
-	return 0;
+out:
+	free(rundir);
+	return ret;
 }
 
 static int ls_send_str(int fd, const char *buf)

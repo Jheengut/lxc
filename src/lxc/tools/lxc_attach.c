@@ -23,7 +23,6 @@
 
 #include "config.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -65,6 +64,7 @@ static const struct option my_longopts[] = {
 	{"keep-var", required_argument, 0, 502},
 	{"set-var", required_argument, 0, 'v'},
 	{"pty-log", required_argument, 0, 'L'},
+	{"rcfile", required_argument, 0, 'f'},
 	LXC_COMMON_OPTIONS
 };
 
@@ -82,7 +82,8 @@ static int add_to_simple_array(char ***array, ssize_t *capacity, char *value)
 {
 	ssize_t count = 0;
 
-	assert(array);
+	if (!array)
+		return -1;
 
 	if (*array)
 		for (; (*array)[count]; count++);
@@ -98,7 +99,8 @@ static int add_to_simple_array(char ***array, ssize_t *capacity, char *value)
 		*capacity = new_capacity;
 	}
 
-	assert(*array);
+	if (!(*array))
+		return -1;
 
 	(*array)[count] = value;
 	return 0;
@@ -106,6 +108,8 @@ static int add_to_simple_array(char ***array, ssize_t *capacity, char *value)
 
 static int my_parser(struct lxc_arguments* args, int c, char* arg)
 {
+	char **it;
+	char *del;
 	int ret;
 
 	switch (c) {
@@ -124,6 +128,30 @@ static int my_parser(struct lxc_arguments* args, int c, char* arg)
 		break;
 	case 's':
 		namespace_flags = 0;
+
+		/* The identifiers for namespaces used with lxc-attach as given
+		 * on the manpage do not align with the standard identifiers.
+		 * This affects network, mount, and uts namespaces. The standard
+		 * identifiers are: "mnt", "uts", and "net" whereas lxc-attach
+		 * uses "MOUNT", "UTSNAME", and "NETWORK". So let's use some
+		 * cheap memmove()s to replace them by their standard
+		 * identifiers. Let's illustrate this with an example:
+		 * Assume the string:
+		 *
+		 *	"IPC|MOUNT|PID"
+		 *
+		 * then we memmove()
+		 *
+		 *	dest: del + 1 == ONT|PID
+		 *	src:  del + 3 == NT|PID
+		 */
+		while ((del = strstr(arg, "MOUNT")))
+			memmove(del + 1, del + 3, strlen(del) - 2);
+
+		for (it = (char *[]){"NETWORK", "UTSNAME", NULL}; it && *it; it++)
+			while ((del = strstr(arg, *it)))
+				memmove(del + 3, del + 7, strlen(del) - 6);
+
 		ret = lxc_fill_namespace_flags(arg, &namespace_flags);
 		if (ret)
 			return -1;
@@ -152,6 +180,9 @@ static int my_parser(struct lxc_arguments* args, int c, char* arg)
 		break;
 	case 'L':
 		args->console_log = arg;
+		break;
+	case 'f':
+		args->rcfile = arg;
 		break;
 	}
 
@@ -196,13 +227,16 @@ Options :\n\
                     is the current default behaviour, but is likely to\n\
                     change in the future.\n\
   -L, --pty-log=FILE\n\
-		    Log pty output to FILE\n\
+                    Log pty output to FILE\n\
   -v, --set-var     Set an additional variable that is seen by the\n\
                     attached program in the container. May be specified\n\
                     multiple times.\n\
       --keep-var    Keep an additional environment variable. Only\n\
                     applicable if --clear-env is specified. May be used\n\
-                    multiple times.\n",
+                    multiple times.\n\
+  -f, --rcfile=FILE\n\
+                    Load configuration file FILE\n\
+",
 	.options  = my_longopts,
 	.parser   = my_parser,
 	.checker  = NULL,
@@ -316,7 +350,7 @@ static int get_pty_on_host(struct lxc_container *c, struct wrapargs *wrap, int *
 err3:
 	lxc_mainloop_close(&descr);
 err2:
-	if (ts->sigfd != -1)
+	if (ts && ts->sigfd != -1)
 		lxc_console_sigwinch_fini(ts);
 err1:
 	lxc_console_delete(&conf->console);
@@ -362,7 +396,7 @@ int main(int argc, char *argv[])
 	lxc_log_options_no_override();
 
 	if (geteuid()) {
-		if (access(my_args.lxcpath[0], O_RDWR) < 0) {
+		if (access(my_args.lxcpath[0], O_RDONLY) < 0) {
 			if (!my_args.quiet)
 				fprintf(stderr, "You lack access to %s\n", my_args.lxcpath[0]);
 			exit(EXIT_FAILURE);
@@ -372,6 +406,21 @@ int main(int argc, char *argv[])
 	struct lxc_container *c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
 	if (!c)
 		exit(EXIT_FAILURE);
+
+	if (my_args.rcfile) {
+		c->clear_config(c);
+		if (!c->load_config(c, my_args.rcfile)) {
+			ERROR("Failed to load rcfile");
+			lxc_container_put(c);
+			exit(EXIT_FAILURE);
+		}
+		c->configfile = strdup(my_args.rcfile);
+		if (!c->configfile) {
+			ERROR("Out of memory setting new config filename");
+			lxc_container_put(c);
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	if (!c->may_control(c)) {
 		fprintf(stderr, "Insufficent privileges to control %s\n", c->name);

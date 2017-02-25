@@ -169,9 +169,6 @@ EOF
         rm -f $container_rootfs/usr/lib/systemd/system/sysinit.target.wants/kmod-static-nodes.service
         chroot $container_rootfs systemctl -q disable graphical.target
         chroot $container_rootfs systemctl -q enable multi-user.target
-        if [ ! -e $container_rootfs/etc/systemd/system/sigpwr.target ]; then
-            chroot $container_rootfs ln -s /usr/lib/systemd/system/halt.target /etc/systemd/system/sigpwr.target
-        fi
 
         # systemd in userns won't be able to set /proc/self/oom_score_adj which
         # prevents the dbus service from starting
@@ -465,12 +462,10 @@ EOF
         fi
     fi
 
-    # add oracle user, set root password
+    # add oracle user
     chroot $container_rootfs useradd -m -s /bin/bash oracle
-    echo "oracle:oracle" | chroot $container_rootfs chpasswd
-    echo "root:root" | chroot $container_rootfs chpasswd
-    printf "Added container user:\033[1moracle\033[0m password:\033[1moracle\033[0m\n"
-    printf "Added container user:\033[1mroot\033[0m password:\033[1mroot\033[0m\n"
+    printf "Added container user:\033[1moracle\033[0m\n"
+    printf "Added container user:\033[1mroot\033[0m\n"
 }
 
 # create the container's lxc config file

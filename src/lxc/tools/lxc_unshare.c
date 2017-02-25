@@ -76,13 +76,13 @@ static void usage(char *cmd)
 	fprintf(stderr, "\t -i <iface>   : Interface name to be moved into container (presumably with NETWORK unsharing set)\n");
 	fprintf(stderr, "\t -H <hostname>: Set the hostname in the container\n");
 	fprintf(stderr, "\t -d           : Daemonize (do not wait for container to exit)\n");
-	fprintf(stderr, "\t -M           : reMount default fs inside container (/proc /dev/shm /dev/mqueue)\n");
-	_exit(1);
+	fprintf(stderr, "\t -M           : Remount default fs inside container (/proc /dev/shm /dev/mqueue)\n");
+	_exit(EXIT_SUCCESS);
 }
 
 static bool lookup_user(const char *optarg, uid_t *uid)
 {
-	char name[sysconf(_SC_LOGIN_NAME_MAX)];
+	char name[MAXPATHLEN];
 	struct passwd *pwent = NULL;
 
 	if (!optarg || (optarg[0] == '\0'))
@@ -134,13 +134,13 @@ static int do_start(void *arg)
 	if ((flags & CLONE_NEWUTS) && want_hostname)
 		if (sethostname(want_hostname, strlen(want_hostname)) < 0) {
 			ERROR("failed to set hostname %s: %s", want_hostname, strerror(errno));
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 
 	// Setuid is useful even without a new user id space
 	if (start_arg->setuid && setuid(uid)) {
 		ERROR("failed to set uid %d: %s", uid, strerror(errno));
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	execvp(args[0], args);
@@ -151,12 +151,12 @@ static int do_start(void *arg)
 
 int main(int argc, char *argv[])
 {
+	char *del;
+	char **it, **args;
 	int opt, status;
 	int ret;
 	char *namespaces = NULL;
-	char **args;
-	int flags = 0;
-	int daemonize = 0;
+	int flags = 0, daemonize = 0;
 	uid_t uid = 0; /* valid only if (flags & CLONE_NEWUSER) */
 	pid_t pid;
 	struct my_iflist *tmpif, *my_iflist = NULL;
@@ -177,7 +177,7 @@ int main(int argc, char *argv[])
 		case 'i':
 			if (!(tmpif = malloc(sizeof(*tmpif)))) {
 				perror("malloc");
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 			tmpif->mi_ifname = optarg;
 			tmpif->mi_next = my_iflist;
@@ -197,21 +197,43 @@ int main(int argc, char *argv[])
 			break;
 		case 'u':
 			if (!lookup_user(optarg, &uid))
-				return 1;
+				exit(EXIT_FAILURE);
 			start_arg.setuid = true;
 		}
 	}
 
 	if (argv[optind] == NULL) {
 		ERROR("a command to execute in the new namespace is required");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	args = &argv[optind];
 
 	ret = lxc_caps_init();
 	if (ret)
-		return 1;
+		exit(EXIT_FAILURE);
+
+	/* The identifiers for namespaces used with lxc-unshare as given on the
+	 * manpage do not align with the standard identifiers. This affects
+	 * network, mount, and uts namespaces. The standard identifiers are:
+	 * "mnt", "uts", and "net" whereas lxc-unshare uses "MOUNT", "UTSNAME",
+	 * and "NETWORK". So let's use some cheap memmove()s to replace them by
+	 * their standard identifiers. Let's illustrate this with an example:
+	 * Assume the string:
+	 *
+	 *	"IPC|MOUNT|PID"
+	 *
+	 * then we memmove()
+	 *
+	 *	dest: del + 1 == ONT|PID
+	 *	src:  del + 3 == NT|PID
+	 */
+	while ((del = strstr(namespaces, "MOUNT")))
+		memmove(del + 1, del + 3, strlen(del) - 2);
+
+	for (it = (char *[]){"NETWORK", "UTSNAME", NULL}; it && *it; it++)
+		while ((del = strstr(namespaces, *it)))
+			memmove(del + 3, del + 7, strlen(del) - 6);
 
 	ret = lxc_fill_namespace_flags(namespaces, &flags);
 	if (ret)
@@ -219,23 +241,23 @@ int main(int argc, char *argv[])
 
 	if (!(flags & CLONE_NEWNET) && my_iflist) {
 		ERROR("-i <interfacename> needs -s NETWORK option");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	if (!(flags & CLONE_NEWUTS) && start_arg.want_hostname) {
 		ERROR("-H <hostname> needs -s UTSNAME option");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	if (!(flags & CLONE_NEWNS) && start_arg.want_default_mounts) {
 		ERROR("-M needs -s MOUNT option");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	pid = lxc_clone(do_start, &start_arg, flags);
 	if (pid < 0) {
 		ERROR("failed to clone");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	if (my_iflist) {
@@ -246,12 +268,13 @@ int main(int argc, char *argv[])
 	}
 
 	if (daemonize)
-		exit(0);
+		exit(EXIT_SUCCESS);
 
 	if (waitpid(pid, &status, 0) < 0) {
 		ERROR("failed to wait for '%d'", pid);
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
-	return  lxc_error_set_and_log(pid, status);
+	/* Call exit() directly on this function because it retuns an exit code. */
+	exit(lxc_error_set_and_log(pid, status));
 }

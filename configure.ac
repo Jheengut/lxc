@@ -1,11 +1,16 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
+m4_define([lxc_devel], 1)
 m4_define([lxc_version_major], 2)
 m4_define([lxc_version_minor], 0)
 m4_define([lxc_version_micro], 0)
 m4_define([lxc_version_beta], [])
-m4_define([lxc_version_abi], 1.2.0)
+
+m4_define([lxc_abi_major], 1)
+m4_define([lxc_abi_minor], 2)
+m4_define([lxc_abi_micro], 0)
+m4_define([lxc_abi], [lxc_abi_major.lxc_abi_minor.lxc_abi_micro])
 
 m4_define([lxc_version_base], [lxc_version_major.lxc_version_minor.lxc_version_micro])
 m4_define([lxc_version],
@@ -22,8 +27,13 @@ AC_SUBST(LXC_VERSION_BETA, lxc_version_beta)
 AC_SUBST([LXC_VERSION_MAJOR], [lxc_version_major])
 AC_SUBST([LXC_VERSION_MINOR], [lxc_version_minor])
 AC_SUBST([LXC_VERSION_MICRO], [lxc_version_micro])
-AC_SUBST([LXC_VERSION_ABI], [lxc_version_abi])
 AC_SUBST([LXC_VERSION], [lxc_version])
+AC_SUBST([LXC_DEVEL], [lxc_devel])
+
+AC_SUBST([LXC_ABI_MAJOR], [lxc_abi_major])
+AC_SUBST([LXC_ABI_MINOR], [lxc_abi_minor])
+AC_SUBST([LXC_ABI_MICRO], [lxc_abi_micro])
+AC_SUBST([LXC_ABI], [lxc_abi])
 
 AC_CONFIG_SRCDIR([configure.ac])
 AC_CONFIG_AUX_DIR([config])
@@ -32,6 +42,10 @@ AM_INIT_AUTOMAKE([-Wall -Werror -Wno-portability subdir-objects])
 AC_CANONICAL_HOST
 AM_PROG_CC_C_O
 AC_GNU_SOURCE
+
+# libtool
+LT_INIT
+AC_SUBST([LIBTOOL_DEPS])
 
 # Detect the distribution. This is used for the default configuration and
 # for some distro-specific build options.
@@ -57,6 +71,7 @@ if test "z$with_distro" = "z"; then
 	AC_CHECK_FILE(/etc/mandriva-release,with_distro="openmandriva")
 	AC_CHECK_FILE(/etc/pardus-release,with_distro="pardus")
 	AC_CHECK_FILE(/etc/altlinux-release,with_distro="altlinux")
+	AC_CHECK_FILE(/etc/pld-release,with_distro="pld")
 fi
 with_distro=`echo ${with_distro} | tr '[[:upper:]]' '[[:lower:]]'`
 
@@ -72,7 +87,7 @@ case $with_distro in
 		distroconf=default.conf.lxcbr
 		distrosysconf="$sysconfdir/default"
 		;;
-	redhat|centos|fedora|oracle|oracleserver|sparclinux|altlinux|suse|opensuse*|plamo)
+	redhat|centos|fedora|oracle|oracleserver|sparclinux|altlinux|suse|opensuse*|plamo|pld)
 		distroconf=default.conf.lxcbr
 		distrosysconf="$sysconfdir/sysconfig"
 		;;
@@ -107,6 +122,9 @@ case "$with_init_script" in
 				;;
 			ubuntu)
 				init_script=upstart,systemd
+				;;
+			pld)
+				init_script=sysvinit,upstart,systemd
 				;;
 			*)
 				echo -n "Linux distribution init system unknown."
@@ -148,6 +166,11 @@ if test "x$with_systemdsystemunitdir" != "xno"; then
   AC_SUBST([SYSTEMD_UNIT_DIR], [$with_systemdsystemunitdir])
 fi
 
+AC_ARG_ENABLE([werror],
+	[AC_HELP_STRING([--disable-werror],
+	[do not treat warnings as errors])],
+	[], [enable_werror=yes])
+
 # Allow enabling deprecated executables
 AC_ARG_ENABLE([deprecated],
 	[AC_HELP_STRING([--enable-deprecated],
@@ -168,7 +191,7 @@ AC_ARG_ENABLE([doc],
 
 if test "x$enable_doc" = "xyes" -o "x$enable_doc" = "xauto"; then
 	db2xman=""
-	dbparsers="docbook2x-man db2x_docbook2man docbook2man docbook-to-man"
+	dbparsers="docbook2X2man docbook2x-man db2x_docbook2man docbook2man docbook-to-man"
 
 	AC_MSG_CHECKING(for docbook2x-man)
 	for name in ${dbparsers}; do
@@ -233,12 +256,25 @@ if test "$enable_apparmor" = "auto" ; then
 fi
 AM_CONDITIONAL([ENABLE_APPARMOR], [test "x$enable_apparmor" = "xyes"])
 
-AC_CHECK_LIB([gnutls], [gnutls_hash_fast], [enable_gnutls=yes], [enable_gnutls=no])
-
 AM_COND_IF([ENABLE_APPARMOR],
 	[AC_CHECK_HEADER([sys/apparmor.h],[],[AC_MSG_ERROR([You must install the AppArmor development package in order to compile lxc])])
 	AC_CHECK_LIB([apparmor], [aa_change_profile],[],[AC_MSG_ERROR([You must install the AppArmor development package in order to compile lxc])])
 	AC_SUBST([APPARMOR_LIBS], [-lapparmor])])
+
+# GnuTLS
+AC_ARG_ENABLE([gnutls],
+	[AC_HELP_STRING([--enable-gnutls], [enable GnuTLS support [default=auto]])],
+	[], [enable_gnutls=auto])
+
+if test "$enable_gnutls" = "auto" ; then
+	AC_CHECK_LIB([gnutls], [gnutls_hash_fast], [enable_gnutls=yes], [enable_gnutls=no])
+fi
+AM_CONDITIONAL([ENABLE_GNUTLS], [test "x$enable_gnutls" = "xyes"])
+
+AM_COND_IF([ENABLE_GNUTLS],
+	[AC_CHECK_HEADER([gnutls/gnutls.h],[],[AC_MSG_ERROR([You must install the GnuTLS development package in order to compile lxc])])
+	AC_CHECK_LIB([gnutls], [gnutls_hash_fast],[],[AC_MSG_ERROR([You must install the GnuTLS development package in order to compile lxc])])
+	AC_SUBST([GNUTLS_LIBS], [-lgnutls])])
 
 # SELinux
 AC_ARG_ENABLE([selinux],
@@ -334,7 +370,8 @@ fi
 AM_CONDITIONAL([ENABLE_CAP], [test "x$enable_capabilities" = "xyes"])
 
 AM_COND_IF([ENABLE_CAP],
-	[AC_CHECK_LIB(cap,cap_set_proc,[true],[AC_MSG_ERROR([You are missing libcap support.])])
+	[AC_CHECK_HEADER([sys/capability.h],[],[AC_MSG_ERROR([You must install the libcap development package in order to compile lxc])])
+	AC_CHECK_LIB(cap,cap_set_proc,[],[AC_MSG_ERROR([You must install the libcap development package in order to compile lxc])])
 	AC_SUBST([CAP_LIBS], [-lcap])])
 
 # HAVE_SCMP_FILTER_CTX=1 will tell us we have libseccomp api >= 1.0.0
@@ -455,6 +492,14 @@ AC_ARG_ENABLE([bash],
 	[AC_HELP_STRING([--enable-bash], [build bash integration [default=yes]])],
 	[], [enable_bash=yes])
 AM_CONDITIONAL([ENABLE_BASH], [test "x$enable_bash" = "xyes"])
+
+AM_COND_IF([ENABLE_BASH],
+	[AC_MSG_CHECKING([bash completion directory])
+	PKG_CHECK_VAR(bashcompdir, [bash-completion], [completionsdir], ,
+		bashcompdir="${sysconfdir}/bash_completion.d")
+	AC_MSG_RESULT([$bashcompdir])
+	AC_SUBST(bashcompdir)
+	])
 
 # Optional test binaries
 AC_ARG_ENABLE([tests],
@@ -589,11 +634,18 @@ AM_CONDITIONAL([IS_BIONIC], [test "x$is_bionic" = "xyes"])
 # Some systems lack PR_CAPBSET_DROP definition => HAVE_DECL_PR_CAPBSET_DROP
 AC_CHECK_DECLS([PR_CAPBSET_DROP], [], [], [#include <sys/prctl.h>])
 
+# Some systems lack PR_{G,S}ET_NO_NEW_PRIVS definition => HAVE_DECL_PR_{G,S}ET_NO_NEW_PRIVS
+AC_CHECK_DECLS([PR_SET_NO_NEW_PRIVS], [], [], [#include <sys/prctl.h>])
+AC_CHECK_DECLS([PR_GET_NO_NEW_PRIVS], [], [], [#include <sys/prctl.h>])
+
 # Check for some headers
-AC_CHECK_HEADERS([sys/signalfd.h pty.h ifaddrs.h sys/capability.h sys/personality.h utmpx.h sys/timerfd.h])
+AC_CHECK_HEADERS([sys/signalfd.h pty.h ifaddrs.h sys/memfd.h sys/personality.h utmpx.h sys/timerfd.h])
+
+# lookup major()/minor()/makedev()
+AC_HEADER_MAJOR
 
 # Check for some syscalls functions
-AC_CHECK_FUNCS([setns pivot_root sethostname unshare rand_r confstr faccessat])
+AC_CHECK_FUNCS([setns pivot_root sethostname unshare rand_r confstr faccessat gettid memfd_create])
 
 # Check for some functions
 AC_CHECK_LIB(pthread, main)
@@ -626,7 +678,10 @@ AC_PROG_SED
 LXC_CHECK_TLS
 
 if test "x$GCC" = "xyes"; then
-	CFLAGS="$CFLAGS -Wall -Werror"
+	CFLAGS="$CFLAGS -Wall"
+	if test "x$enable_werror" = "xyes"; then
+		CFLAGS="$CFLAGS -Werror"
+	fi
 fi
 
 # Files requiring some variable expansion
@@ -689,6 +744,10 @@ AC_CONFIG_FILES([
 	config/templates/openwrt.common.conf
 	config/templates/sparclinux.common.conf
 	config/templates/sparclinux.userns.conf
+	config/templates/voidlinux.common.conf
+	config/templates/voidlinux.userns.conf
+	config/templates/sabayon.common.conf
+	config/templates/sabayon.userns.conf
 	config/templates/userns.conf
 	config/yum/Makefile
 	config/sysconfig/Makefile
@@ -829,16 +888,20 @@ AC_CONFIG_FILES([
 	templates/lxc-debian
 	templates/lxc-download
 	templates/lxc-fedora
+	templates/lxc-fedora-legacy
 	templates/lxc-gentoo
 	templates/lxc-openmandriva
 	templates/lxc-opensuse
 	templates/lxc-oracle
 	templates/lxc-plamo
+	templates/lxc-pld
 	templates/lxc-slackware
 	templates/lxc-sshd
 	templates/lxc-ubuntu
 	templates/lxc-ubuntu-cloud
 	templates/lxc-sparclinux
+	templates/lxc-voidlinux
+	templates/lxc-sabayon
 
 	src/Makefile
 	src/lxc/Makefile

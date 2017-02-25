@@ -157,7 +157,7 @@ static struct cgroup_ops cgfs_ops;
 
 static int cgroup_rmdir(char *dirname)
 {
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	int saved_errno = 0;
 	DIR *dir;
 	int ret, failed=0;
@@ -169,7 +169,7 @@ static int cgroup_rmdir(char *dirname)
 		return -1;
 	}
 
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		struct stat mystat;
 		int rc;
 
@@ -364,6 +364,14 @@ static bool find_cgroup_hierarchies(struct cgroup_meta_data *meta_data,
 		*colon2 = '\0';
 
 		colon2 = NULL;
+
+		/* With cgroupv2 /proc/self/cgroup can contain entries of the
+		 * form: 0::/
+		 * These entries need to be skipped.
+		 */
+		if (!strcmp(colon1, ""))
+			continue;
+
 		hierarchy_number = strtoul(line, &colon2, 10);
 		if (!colon2 || *colon2)
 			continue;
@@ -504,7 +512,7 @@ static bool find_hierarchy_mountpts( struct cgroup_meta_data *meta_data, char **
 			goto out;
 
 		h = NULL;
-		for (k = 1; k <= meta_data->maximum_hierarchy; k++) {
+		for (k = 0; k <= meta_data->maximum_hierarchy; k++) {
 			if (meta_data->hierarchies[k] &&
 			    meta_data->hierarchies[k]->subsystems[0] &&
 			    lxc_string_in_array(meta_data->hierarchies[k]->subsystems[0], (const char **)subsystems)) {
@@ -632,10 +640,10 @@ static struct cgroup_meta_data *lxc_cgroup_put_meta(struct cgroup_meta_data *met
 	if (--meta_data->ref > 0)
 		return meta_data;
 	lxc_free_array((void **)meta_data->mount_points, (lxc_free_fn)lxc_cgroup_mount_point_free);
-	if (meta_data->hierarchies) {
+	if (meta_data->hierarchies)
 		for (i = 0; i <= meta_data->maximum_hierarchy; i++)
-			lxc_cgroup_hierarchy_free(meta_data->hierarchies[i]);
-	}
+			if (meta_data->hierarchies[i])
+				lxc_cgroup_hierarchy_free(meta_data->hierarchies[i]);
 	free(meta_data->hierarchies);
 	free(meta_data);
 	return NULL;
@@ -646,6 +654,8 @@ static struct cgroup_hierarchy *lxc_cgroup_find_hierarchy(struct cgroup_meta_dat
 	size_t i;
 	for (i = 0; i <= meta_data->maximum_hierarchy; i++) {
 		struct cgroup_hierarchy *h = meta_data->hierarchies[i];
+		if (!h)
+			continue;
 		if (h && lxc_string_in_array(subsystem, (const char **)h->subsystems))
 			return h;
 	}
@@ -884,6 +894,8 @@ static struct cgroup_process_info *lxc_cgroupfs_create(const char *name, const c
 	/* find mount points we can use */
 	for (info_ptr = base_info; info_ptr; info_ptr = info_ptr->next) {
 		h = info_ptr->hierarchy;
+		if (!h)
+			continue;
 		mp = lxc_cgroup_find_mount_point(h, info_ptr->cgroup_path, true);
 		if (!mp) {
 			ERROR("Could not find writable mount point for cgroup hierarchy %d while trying to create cgroup.", h->index);
@@ -972,6 +984,9 @@ static struct cgroup_process_info *lxc_cgroupfs_create(const char *name, const c
 		 */
 		for (i = 0, info_ptr = base_info; info_ptr; info_ptr = info_ptr->next, i++) {
 			char *parts2[3];
+
+			if (!info_ptr->hierarchy)
+				continue;
 
 			if (lxc_string_in_array("ns", (const char **)info_ptr->hierarchy->subsystems))
 				continue;
@@ -1071,6 +1086,8 @@ skip:
 
 	/* we're done, now update the paths */
 	for (i = 0, info_ptr = base_info; info_ptr; info_ptr = info_ptr->next, i++) {
+		if (!info_ptr->hierarchy)
+			continue;
 		/* ignore legacy 'ns' subsystem here, lxc_cgroup_create_legacy
 		 * will take care of it
 		 * Since we do a continue in above loop, new_cgroup_paths[i] is
@@ -1108,6 +1125,9 @@ static int lxc_cgroup_create_legacy(struct cgroup_process_info *base_info, const
 	int r;
 
 	for (info_ptr = base_info; info_ptr; info_ptr = info_ptr->next) {
+		if (!info_ptr->hierarchy)
+			continue;
+
 		if (!lxc_string_in_array("ns", (const char **)info_ptr->hierarchy->subsystems))
 			continue;
 		/*
@@ -1192,6 +1212,9 @@ static int lxc_cgroupfs_enter(struct cgroup_process_info *info, pid_t pid, bool 
 
 	snprintf(pid_buf, 32, "%lu", (unsigned long)pid);
 	for (info_ptr = info; info_ptr; info_ptr = info_ptr->next) {
+		if (!info_ptr->hierarchy)
+			continue;
+
 		char *cgroup_path = (enter_sub && info_ptr->cgroup_path_sub) ?
 			info_ptr->cgroup_path_sub :
 			info_ptr->cgroup_path;
@@ -1436,6 +1459,10 @@ static bool cgroupfs_mount_cgroup(void *hdata, const char *root, int type)
 	for (info = base_info; info; info = info->next) {
 		size_t subsystem_count, i;
 		struct cgroup_mount_point *mp = info->designated_mount_point;
+
+		if (!info->hierarchy)
+			continue;
+
 		if (!mountpoint_is_accessible(mp))
 			mp = lxc_cgroup_find_mount_point(info->hierarchy, info->cgroup_path, true);
 
@@ -1685,6 +1712,14 @@ lxc_cgroup_process_info_getx(const char *proc_pid_cgroup_str,
 		*colon2++ = '\0';
 
 		endptr = NULL;
+
+		/* With cgroupv2 /proc/self/cgroup can contain entries of the
+		 * form: 0::/
+		 * These entries need to be skipped.
+		 */
+		if (!strcmp(colon1, ""))
+			continue;
+
 		hierarchy_number = strtoul(line, &endptr, 10);
 		if (!endptr || *endptr)
 			continue;
@@ -1798,9 +1833,16 @@ static void lxc_cgroup_hierarchy_free(struct cgroup_hierarchy *h)
 {
 	if (!h)
 		return;
-	lxc_free_array((void **)h->subsystems, free);
-	free(h->all_mount_points);
+	if (h->subsystems) {
+		lxc_free_array((void **)h->subsystems, free);
+		h->subsystems = NULL;
+	}
+	if (h->all_mount_points) {
+		free(h->all_mount_points);
+		h->all_mount_points = NULL;
+	}
 	free(h);
+	h = NULL;
 }
 
 static bool is_valid_cgroup(const char *name)
@@ -1907,6 +1949,8 @@ find_info_for_subsystem(struct cgroup_process_info *info, const char *subsystem)
 	struct cgroup_process_info *info_ptr;
 	for (info_ptr = info; info_ptr; info_ptr = info_ptr->next) {
 		struct cgroup_hierarchy *h = info_ptr->hierarchy;
+		if (!h)
+			continue;
 		if (lxc_string_in_array(subsystem, (const char **)h->subsystems))
 			return info_ptr;
 	}
@@ -2067,26 +2111,14 @@ out:
 static int cgroup_recursive_task_count(const char *cgroup_path)
 {
 	DIR *d;
-	struct dirent *dent_buf;
 	struct dirent *dent;
-	ssize_t name_max;
 	int n = 0, r;
 
-	/* see man readdir_r(3) */
-	name_max = pathconf(cgroup_path, _PC_NAME_MAX);
-	if (name_max <= 0)
-		name_max = 255;
-	dent_buf = malloc(offsetof(struct dirent, d_name) + name_max + 1);
-	if (!dent_buf)
-		return -1;
-
 	d = opendir(cgroup_path);
-	if (!d) {
-		free(dent_buf);
+	if (!d)
 		return 0;
-	}
 
-	while (readdir_r(d, dent_buf, &dent) == 0 && dent) {
+	while ((dent = readdir(d))) {
 		const char *parts[3] = {
 			cgroup_path,
 			dent->d_name,
@@ -2100,13 +2132,11 @@ static int cgroup_recursive_task_count(const char *cgroup_path)
 		sub_path = lxc_string_join("/", parts, false);
 		if (!sub_path) {
 			closedir(d);
-			free(dent_buf);
 			return -1;
 		}
 		r = stat(sub_path, &st);
 		if (r < 0) {
 			closedir(d);
-			free(dent_buf);
 			free(sub_path);
 			return -1;
 		}
@@ -2122,7 +2152,6 @@ static int cgroup_recursive_task_count(const char *cgroup_path)
 		free(sub_path);
 	}
 	closedir(d);
-	free(dent_buf);
 
 	return n;
 }
@@ -2278,6 +2307,33 @@ static bool init_cpuset_if_needed(struct cgroup_mount_point *mp,
 		do_init_cpuset_file(mp, path, "/cpuset.mems") );
 }
 
+static void print_cgfs_init_debuginfo(struct cgfs_data *d)
+{
+	int i;
+
+	if (!getenv("LXC_DEBUG_CGFS"))
+		return;
+
+	DEBUG("Cgroup information:");
+	DEBUG("  container name: %s", d->name);
+	if (!d->meta || !d->meta->hierarchies) {
+		DEBUG("  No hierarchies found.");
+		return;
+	}
+	DEBUG("  Controllers:");
+	for (i = 0; i <= d->meta->maximum_hierarchy; i++) {
+		char **p;
+		struct cgroup_hierarchy *h = d->meta->hierarchies[i];
+		if (!h) {
+			DEBUG("     Empty hierarchy number %d.", i);
+			continue;
+		}
+		for (p = h->subsystems; p && *p; p++) {
+			DEBUG("     %2d: %s", i, *p);
+		}
+	}
+}
+
 struct cgroup_ops *cgfs_ops_init(void)
 {
 	return &cgfs_ops;
@@ -2303,6 +2359,9 @@ static void *cgfs_init(const char *name)
 		ERROR("cgroupfs failed to detect cgroup metadata");
 		goto err2;
 	}
+
+	print_cgfs_init_debuginfo(d);
+
 	return d;
 
 err2:
@@ -2378,28 +2437,6 @@ static const char *cgfs_get_cgroup(void *hdata, const char *subsystem)
 	return lxc_cgroup_get_hierarchy_path_data(subsystem, d);
 }
 
-static const char *cgfs_canonical_path(void *hdata)
-{
-	struct cgfs_data *d = hdata;
-	struct cgroup_process_info *info_ptr;
-	char *path = NULL;
-
-	if (!d)
-		return NULL;
-
-	for (info_ptr = d->info; info_ptr; info_ptr = info_ptr->next) {
-		if (!path)
-			path = info_ptr->cgroup_path;
-		else if (strcmp(path, info_ptr->cgroup_path) != 0) {
-			ERROR("not all paths match %s, %s has path %s", path,
-				info_ptr->hierarchy->subsystems[0], info_ptr->cgroup_path);
-			return NULL;
-		}
-	}
-
-	return path;
-}
-
 static bool cgfs_escape(void *hdata)
 {
 	struct cgroup_meta_data *md;
@@ -2410,7 +2447,7 @@ static bool cgfs_escape(void *hdata)
 	if (!md)
 		return false;
 
-	for (i = 1; i <= md->maximum_hierarchy; i++) {
+	for (i = 0; i <= md->maximum_hierarchy; i++) {
 		struct cgroup_hierarchy *h = md->hierarchies[i];
 		struct cgroup_mount_point *mp;
 		char *tasks;
@@ -2447,6 +2484,18 @@ static bool cgfs_escape(void *hdata)
 out:
 	lxc_cgroup_put_meta(md);
 	return ret;
+}
+
+static int cgfs_num_hierarchies(void)
+{
+	/* not implemented */
+	return -1;
+}
+
+static bool cgfs_get_hierarchies(int i, char ***out)
+{
+	/* not implemented */
+	return false;
 }
 
 static bool cgfs_unfreeze(void *hdata)
@@ -2608,6 +2657,9 @@ static bool cgfs_chown(void *hdata, struct lxc_conf *conf)
 		return false;
 
 	for (info_ptr = d->info; info_ptr; info_ptr = info_ptr->next) {
+		if (!info_ptr->hierarchy)
+			continue;
+
 		if (!info_ptr->designated_mount_point) {
 			info_ptr->designated_mount_point = lxc_cgroup_find_mount_point(info_ptr->hierarchy, info_ptr->cgroup_path, true);
 			if (!info_ptr->designated_mount_point) {
@@ -2640,8 +2692,9 @@ static struct cgroup_ops cgfs_ops = {
 	.enter = cgfs_enter,
 	.create_legacy = cgfs_create_legacy,
 	.get_cgroup = cgfs_get_cgroup,
-	.canonical_path = cgfs_canonical_path,
 	.escape = cgfs_escape,
+	.num_hierarchies = cgfs_num_hierarchies,
+	.get_hierarchies = cgfs_get_hierarchies,
 	.get = lxc_cgroupfs_get,
 	.set = lxc_cgroupfs_set,
 	.unfreeze = cgfs_unfreeze,

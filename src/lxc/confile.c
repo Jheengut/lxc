@@ -50,6 +50,12 @@
 #include "network.h"
 #include "lxcseccomp.h"
 
+#if HAVE_IFADDRS_H
+#include <ifaddrs.h>
+#else
+#include <../include/ifaddrs.h>
+#endif
+
 #if HAVE_SYS_PERSONALITY_H
 #include <sys/personality.h>
 #endif
@@ -114,6 +120,7 @@ static int config_init_cmd(const char *, const char *, struct lxc_conf *);
 static int config_init_uid(const char *, const char *, struct lxc_conf *);
 static int config_init_gid(const char *, const char *, struct lxc_conf *);
 static int config_ephemeral(const char *, const char *, struct lxc_conf *);
+static int config_no_new_privs(const char *, const char *, struct lxc_conf *);
 
 static struct lxc_config_t config[] = {
 
@@ -187,6 +194,7 @@ static struct lxc_config_t config[] = {
 	{ "lxc.init_gid",             config_init_gid             },
 	{ "lxc.ephemeral",            config_ephemeral            },
 	{ "lxc.syslog",               config_syslog               },
+	{ "lxc.no_new_privs",	      config_no_new_privs	  },
 };
 
 struct signame {
@@ -271,23 +279,6 @@ static const struct signame signames[] = {
 #ifdef SIGSYS
 	{ SIGSYS,    "SYS" },
 #endif
-};
-
-struct syslog_facility {
-	const char *name;
-	int facility;
-};
-
-static const struct syslog_facility syslog_facilities[] = {
-	{ "daemon",	LOG_DAEMON },
-	{ "local0",	LOG_LOCAL0 },
-	{ "local1",	LOG_LOCAL1 },
-	{ "local2",	LOG_LOCAL2 },
-	{ "local3",	LOG_LOCAL3 },
-	{ "local4",	LOG_LOCAL4 },
-	{ "local5",	LOG_LOCAL5 },
-	{ "local6",	LOG_LOCAL6 },
-	{ "local7",	LOG_LOCAL7 },
 };
 
 static const size_t config_size = sizeof(config)/sizeof(struct lxc_config_t);
@@ -687,16 +678,85 @@ static int config_network_flags(const char *key, const char *value,
 	return 0;
 }
 
+static int set_network_link(const char *key, const char *value, struct lxc_conf *lxc_conf)
+{
+        struct lxc_netdev *netdev;
+
+        netdev = network_netdev(key, value, &lxc_conf->network);
+        if (!netdev)
+                return -1;
+
+        return network_ifname(&netdev->link, value);
+}
+
+static int create_matched_ifnames(const char *value, struct lxc_conf *lxc_conf)
+{
+	struct ifaddrs *ifaddr, *ifa;
+	const char *type_key = "lxc.network.type";
+	const char *link_key = "lxc.network.link";
+	const char *tmpvalue = "phys";
+	int n, ret = 0;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		SYSERROR("Get network interfaces failed");
+		return -1;
+	}
+
+	for (ifa = ifaddr, n = 0; ifa != NULL; ifa = ifa->ifa_next, n++) {
+		if (!ifa->ifa_addr)
+			continue;
+		if (ifa->ifa_addr->sa_family != AF_PACKET)
+			continue;
+
+		if (!strncmp(value, ifa->ifa_name, strlen(value)-1)) {
+			ret = config_network_type(type_key, tmpvalue, lxc_conf);
+			if (!ret) {
+				ret = set_network_link(link_key, ifa->ifa_name, lxc_conf);
+				if (ret) {
+					ERROR("failed to create matched ifnames");
+					break;
+				}
+			} else {
+				ERROR("failed to create matched ifnames");
+				break;
+			}
+		}
+	}
+
+	freeifaddrs(ifaddr); /* free the dynamic memory */
+	ifaddr = NULL;	    /* prevent use after free */
+
+	return ret;
+}
+
 static int config_network_link(const char *key, const char *value,
 			       struct lxc_conf *lxc_conf)
 {
 	struct lxc_netdev *netdev;
+	struct lxc_list * it;
+	int ret = 0;
 
 	netdev = network_netdev(key, value, &lxc_conf->network);
 	if (!netdev)
 		return -1;
 
-	return network_ifname(&netdev->link, value);
+	if (value[strlen(value) - 1] == '+' && netdev->type == LXC_NET_PHYS) {
+		//get the last network list and remove it.
+		it = lxc_conf->network.prev;
+		if (((struct lxc_netdev *)(it->elem))->type != LXC_NET_PHYS) {
+			ERROR("lxc config cannot support string pattern matching for this link type");
+			return -1;
+		}
+
+		lxc_list_del(it);
+		free(it);
+		ret = create_matched_ifnames(value, lxc_conf);
+
+	} else {
+		ret = network_ifname(&netdev->link, value);
+	}
+
+	return ret;
 }
 
 static int config_network_name(const char *key, const char *value,
@@ -810,6 +870,9 @@ static int config_network_ipv4(const char *key, const char *value,
 	struct lxc_list *list;
 	char *cursor, *slash, *addr = NULL, *bcast = NULL, *prefix = NULL;
 
+	if (!value || !strlen(value))
+		return lxc_clear_config_item(lxc_conf, key);
+
 	netdev = network_netdev(key, value, &lxc_conf->network);
 	if (!netdev)
 		return -1;
@@ -868,8 +931,12 @@ static int config_network_ipv4(const char *key, const char *value,
 	}
 
 	/* no prefix specified, determine it from the network class */
-	inetdev->prefix = prefix ? atoi(prefix) :
-		config_ip_prefix(&inetdev->addr);
+	if (prefix) {
+		if (lxc_safe_uint(prefix, &inetdev->prefix) < 0)
+			return -1;
+	} else {
+		inetdev->prefix = config_ip_prefix(&inetdev->addr);
+	}
 
 	/* if no broadcast address, let compute one from the
 	 * prefix and address
@@ -933,6 +1000,9 @@ static int config_network_ipv6(const char *key, const char *value,
 	char *slash,*valdup;
 	char *netmask;
 
+	if (!value || !strlen(value))
+		return lxc_clear_config_item(lxc_conf, key);
+
 	netdev = network_netdev(key, value, &lxc_conf->network);
 	if (!netdev)
 		return -1;
@@ -967,7 +1037,8 @@ static int config_network_ipv6(const char *key, const char *value,
 	if (slash) {
 		*slash = '\0';
 		netmask = slash + 1;
-		inet6dev->prefix = atoi(netmask);
+		if (lxc_safe_uint(netmask, &inet6dev->prefix) < 0)
+			return -1;
 	}
 
 	if (!inet_pton(AF_INET6, valdup, &inet6dev->addr)) {
@@ -1075,14 +1146,24 @@ static int config_init_cmd(const char *key, const char *value,
 static int config_init_uid(const char *key, const char *value,
 				 struct lxc_conf *lxc_conf)
 {
-	lxc_conf->init_uid = atoi(value);
+	unsigned int init_uid;
+
+	if (lxc_safe_uint(value, &init_uid) < 0)
+		return -1;
+	lxc_conf->init_uid = init_uid;
+
 	return 0;
 }
 
 static int config_init_gid(const char *key, const char *value,
 				 struct lxc_conf *lxc_conf)
 {
-	lxc_conf->init_gid = atoi(value);
+	unsigned int init_gid;
+
+	if (lxc_safe_uint(value, &init_gid) < 0)
+		return -1;
+	lxc_conf->init_gid = init_gid;
+
 	return 0;
 }
 
@@ -1142,9 +1223,8 @@ static int config_personality(const char *key, const char *value,
 static int config_pts(const char *key, const char *value,
 		      struct lxc_conf *lxc_conf)
 {
-	int maxpts = atoi(value);
-
-	lxc_conf->pts = maxpts;
+	if (lxc_safe_uint(value, &lxc_conf->pts) < 0)
+		return -1;
 
 	return 0;
 }
@@ -1153,15 +1233,20 @@ static int config_start(const char *key, const char *value,
 		      struct lxc_conf *lxc_conf)
 {
 	if(strcmp(key, "lxc.start.auto") == 0) {
-		lxc_conf->start_auto = atoi(value);
+		if (lxc_safe_uint(value, &lxc_conf->start_auto) < 0)
+			return -1;
+		if (lxc_conf->start_auto > 1)
+			return -1;
 		return 0;
 	}
 	else if (strcmp(key, "lxc.start.delay") == 0) {
-		lxc_conf->start_delay = atoi(value);
+		if (lxc_safe_uint(value, &lxc_conf->start_delay) < 0)
+			return -1;
 		return 0;
 	}
 	else if (strcmp(key, "lxc.start.order") == 0) {
-		lxc_conf->start_order = atoi(value);
+		if (lxc_safe_int(value, &lxc_conf->start_order) < 0)
+			return -1;
 		return 0;
 	}
 	SYSERROR("Unknown key: %s", key);
@@ -1172,7 +1257,8 @@ static int config_monitor(const char *key, const char *value,
 			  struct lxc_conf *lxc_conf)
 {
 	if(strcmp(key, "lxc.monitor.unshare") == 0) {
-		lxc_conf->monitor_unshare = atoi(value);
+		if (lxc_safe_uint(value, &lxc_conf->monitor_unshare) < 0)
+			return -1;
 		return 0;
 	}
 	SYSERROR("Unknown key: %s", key);
@@ -1255,9 +1341,8 @@ freak_out:
 static int config_tty(const char *key, const char *value,
 		      struct lxc_conf *lxc_conf)
 {
-	int nbtty = atoi(value);
-
-	lxc_conf->tty = nbtty;
+	if (lxc_safe_uint(value, &lxc_conf->tty) < 0)
+		return -1;
 
 	return 0;
 }
@@ -1271,9 +1356,11 @@ static int config_ttydir(const char *key, const char *value,
 static int config_kmsg(const char *key, const char *value,
 			  struct lxc_conf *lxc_conf)
 {
-	int v = atoi(value);
+	if (lxc_safe_uint(value, &lxc_conf->kmsg) < 0)
+		return -1;
 
-	lxc_conf->kmsg = v;
+	if (lxc_conf->kmsg > 1)
+		return -1;
 
 	return 0;
 }
@@ -1287,9 +1374,13 @@ static int config_lsm_aa_profile(const char *key, const char *value,
 static int config_lsm_aa_incomplete(const char *key, const char *value,
 				 struct lxc_conf *lxc_conf)
 {
-	int v = atoi(value);
+	if (lxc_safe_uint(value, &lxc_conf->lsm_aa_allow_incomplete) < 0)
+		return -1;
 
-	lxc_conf->lsm_aa_allow_incomplete = v == 1 ? 1 : 0;
+	if (lxc_conf->lsm_aa_allow_incomplete > 1) {
+		ERROR("Wrong value for lxc.lsm_aa_allow_incomplete. Can only be set to 0 or 1");
+		return -1;
+	}
 
 	return 0;
 }
@@ -1321,10 +1412,12 @@ static int config_loglevel(const char *key, const char *value,
 	if (!value || strlen(value) == 0)
 		return 0;
 
-	if (value[0] >= '0' && value[0] <= '9')
-		newlevel = atoi(value);
-	else
+	if (value[0] >= '0' && value[0] <= '9') {
+		if (lxc_safe_int(value, &newlevel) < 0)
+			return -1;
+	} else {
 		newlevel = lxc_log_priority_to_int(value);
+	}
 	// store these values in the lxc_conf, and then try to set for
 	// actual current logging.
 	lxc_conf->loglevel = newlevel;
@@ -1334,9 +1427,13 @@ static int config_loglevel(const char *key, const char *value,
 static int config_autodev(const char *key, const char *value,
 			  struct lxc_conf *lxc_conf)
 {
-	int v = atoi(value);
+	if (lxc_safe_uint(value, &lxc_conf->autodev) < 0)
+		return -1;
 
-	lxc_conf->autodev = v;
+	if (lxc_conf->autodev > 1) {
+		ERROR("Wrong value for lxc.autodev. Can only be set to 0 or 1");
+		return -1;
+	}
 
 	return 0;
 }
@@ -1805,7 +1902,7 @@ int append_unexp_config_line(const char *line, struct lxc_conf *conf)
 
 static int do_includedir(const char *dirp, struct lxc_conf *lxc_conf)
 {
-	struct dirent dirent, *direntp;
+	struct dirent *direntp;
 	DIR *dir;
 	char path[MAXPATHLEN];
 	int ret = -1, len;
@@ -1816,7 +1913,7 @@ static int do_includedir(const char *dirp, struct lxc_conf *lxc_conf)
 		return -1;
 	}
 
-	while (!readdir_r(dir, &dirent, &direntp)) {
+	while ((direntp = readdir(dir))) {
 		const char *fnam;
 		if (!direntp)
 			break;
@@ -2027,8 +2124,8 @@ int lxc_config_read(const char *file, struct lxc_conf *conf, bool from_include)
 	}
 
 	/* Catch only the top level config file name in the structure */
-	if( ! conf->rcfile )
-		conf->rcfile = strdup( file );
+	if(!conf->rcfile)
+		conf->rcfile = strdup(file);
 
 	return lxc_file_for_each_line(file, parse_line, &c);
 }
@@ -2079,9 +2176,26 @@ signed long lxc_config_parse_arch(const char *arch)
 		{ "i586", PER_LINUX32 },
 		{ "i686", PER_LINUX32 },
 		{ "athlon", PER_LINUX32 },
+		{ "mips", PER_LINUX32 },
+		{ "mipsel", PER_LINUX32 },
+		{ "ppc", PER_LINUX32 },
+		{ "arm", PER_LINUX32 },
+		{ "armv7l", PER_LINUX32 },
+		{ "armhf", PER_LINUX32 },
+		{ "armel", PER_LINUX32 },
+		{ "powerpc", PER_LINUX32 },
 		{ "linux64", PER_LINUX },
 		{ "x86_64", PER_LINUX },
 		{ "amd64", PER_LINUX },
+		{ "mips64", PER_LINUX },
+		{ "mips64el", PER_LINUX },
+		{ "ppc64", PER_LINUX },
+		{ "ppc64le", PER_LINUX },
+		{ "ppc64el", PER_LINUX },
+		{ "powerpc64", PER_LINUX },
+		{ "s390x", PER_LINUX },
+		{ "aarch64", PER_LINUX },
+		{ "arm64", PER_LINUX },
 	};
 	size_t len = sizeof(pername) / sizeof(pername[0]);
 
@@ -2560,6 +2674,10 @@ int lxc_get_config_item(struct lxc_conf *c, const char *key, char *retv,
 		return lxc_get_conf_int(c, retv, inlen, c->init_gid);
 	else if (strcmp(key, "lxc.ephemeral") == 0)
 		return lxc_get_conf_int(c, retv, inlen, c->ephemeral);
+	else if (strcmp(key, "lxc.syslog") == 0)
+		v = c->syslog;
+	else if (strcmp(key, "lxc.no_new_privs") == 0)
+		return lxc_get_conf_int(c, retv, inlen, c->no_new_privs);
 	else return -1;
 
 	if (!v)
@@ -2845,21 +2963,21 @@ next:
 	} \
 }
 
-static void new_hwaddr(char *hwaddr)
+static bool new_hwaddr(char *hwaddr)
 {
-	FILE *f;
-	f = fopen("/dev/urandom", "r");
-	if (f) {
-		unsigned int seed;
-		int ret = fread(&seed, sizeof(seed), 1, f);
-		if (ret != 1)
-			seed = time(NULL);
-		fclose(f);
-		srand(seed);
-	} else
-		srand(time(NULL));
-	snprintf(hwaddr, 18, "00:16:3e:%02x:%02x:%02x",
-			rand() % 255, rand() % 255, rand() % 255);
+	int ret;
+
+	/* COMMENT(brauner): Initialize random number generator. */
+	(void)randseed(true);
+
+	ret = snprintf(hwaddr, 18, "00:16:3e:%02x:%02x:%02x", rand() % 255,
+		       rand() % 255, rand() % 255);
+	if (ret < 0 || ret >= 18) {
+		SYSERROR("Failed to call snprintf().");
+		return false;
+	}
+
+	return true;
 }
 
 /*
@@ -2881,27 +2999,33 @@ bool network_new_hwaddrs(struct lxc_conf *conf)
 
 	if (!conf->unexpanded_config)
 		return true;
+
 	while (*lstart) {
 		char newhwaddr[18], oldhwaddr[17];
+
 		lend = strchr(lstart, '\n');
 		if (!lend)
 			lend = lstart + strlen(lstart);
 		else
 			lend++;
+
 		if (strncmp(lstart, key, strlen(key)) != 0) {
 			lstart = lend;
 			continue;
 		}
+
 		p = strchr(lstart+strlen(key), '=');
 		if (!p) {
 			lstart = lend;
 			continue;
 		}
+
 		p++;
 		while (isblank(*p))
 			p++;
 		if (!*p)
 			return true;
+
 		p2 = p;
 		while (*p2 && !isblank(*p2) && *p2 != '\n')
 			p2++;
@@ -2910,8 +3034,12 @@ bool network_new_hwaddrs(struct lxc_conf *conf)
 			lstart = lend;
 			continue;
 		}
+
 		memcpy(oldhwaddr, p, 17);
-		new_hwaddr(newhwaddr);
+
+		if (!new_hwaddr(newhwaddr))
+			return false;
+
 		memcpy(p, newhwaddr, 17);
 		lxc_list_for_each(it, &conf->network) {
 			struct lxc_netdev *n = it->elem;
@@ -2921,38 +3049,52 @@ bool network_new_hwaddrs(struct lxc_conf *conf)
 
 		lstart = lend;
 	}
+
 	return true;
 }
 
 static int config_ephemeral(const char *key, const char *value,
 			    struct lxc_conf *lxc_conf)
 {
-	int v = atoi(value);
+	if (lxc_safe_uint(value, &lxc_conf->ephemeral) < 0)
+		return -1;
 
-	if (v != 0 && v != 1) {
+	if (lxc_conf->ephemeral > 1) {
 		ERROR("Wrong value for lxc.ephemeral. Can only be set to 0 or 1");
 		return -1;
-	} else {
-		lxc_conf->ephemeral = v;
 	}
 
 	return 0;
 }
 
 static int config_syslog(const char *key, const char *value,
-			    struct lxc_conf *lxc_conf)
+			 struct lxc_conf *lxc_conf)
 {
-	int n;
-	int facility = -1;
-
-	for (n = 0; n < sizeof(syslog_facilities) / sizeof((syslog_facilities)[0]); n++) {
-		if (strcasecmp(syslog_facilities[n].name, value) == 0) {
-			facility = syslog_facilities[n].facility;
-			lxc_log_syslog(facility);
-			return 0;
-		}
+	int facility;
+	facility = lxc_syslog_priority_to_int(value);
+	if (facility == -EINVAL) {
+		ERROR("Wrong value for lxc.syslog.");
+		return -1;
 	}
 
-	ERROR("Wrong value for lxc.syslog");
-	return -1;
+	lxc_log_syslog(facility);
+	return config_string_item(&lxc_conf->syslog, value);
+}
+
+static int config_no_new_privs(const char *key, const char *value,
+				    struct lxc_conf *lxc_conf)
+{
+	unsigned int v;
+
+	if (lxc_safe_uint(value, &v) < 0)
+		return -1;
+
+	if (v > 1) {
+		ERROR("Wrong value for lxc.no_new_privs. Can only be set to 0 or 1");
+		return -1;
+	}
+
+	lxc_conf->no_new_privs = v ? true : false;
+
+	return 0;
 }

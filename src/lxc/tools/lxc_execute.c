@@ -58,10 +58,19 @@ static int my_checker(const struct lxc_arguments* args)
 static int my_parser(struct lxc_arguments* args, int c, char* arg)
 {
 	switch (c) {
-	case 'f': args->rcfile = arg; break;
-	case 's': return lxc_config_define_add(&defines, arg); break;
-	case 'u': args->uid = atoi(arg); break;
-	case 'g': args->gid = atoi(arg);
+	case 'f':
+		args->rcfile = arg;
+		break;
+	case 's':
+		return lxc_config_define_add(&defines, arg);
+		break;
+	case 'u':
+		if (lxc_safe_uint(arg, &args->uid) < 0)
+			return -1;
+		break;
+	case 'g':
+		if (lxc_safe_uint(arg, &args->gid) < 0)
+			return -1;
 	}
 	return 0;
 }
@@ -86,8 +95,8 @@ Options :\n\
   -n, --name=NAME      NAME of the container\n\
   -f, --rcfile=FILE    Load configuration file FILE\n\
   -s, --define KEY=VAL Assign VAL to configuration variable KEY\n\
-  -u, --uid=UID Execute COMMAND with UID inside the container\n\
-  -g, --gid=GID Execute COMMAND with GID inside the container\n",
+  -u, --uid=UID        Execute COMMAND with UID inside the container\n\
+  -g, --gid=GID        Execute COMMAND with GID inside the container\n",
 	.options  = my_longopts,
 	.parser   = my_parser,
 	.checker  = my_checker,
@@ -102,14 +111,14 @@ int main(int argc, char *argv[])
 	lxc_list_init(&defines);
 
 	if (lxc_caps_init())
-		return 1;
+		exit(EXIT_FAILURE);
 
 	if (lxc_arguments_parse(&my_args, argc, argv))
-		return 1;
+		exit(EXIT_FAILURE);
 
 	if (lxc_log_init(my_args.name, my_args.log_file, my_args.log_priority,
 			 my_args.progname, my_args.quiet, my_args.lxcpath[0]))
-		return 1;
+		exit(EXIT_FAILURE);
 	lxc_log_options_no_override();
 
 	/* rcfile is specified in the cli option */
@@ -121,7 +130,7 @@ int main(int argc, char *argv[])
 		rc = asprintf(&rcfile, "%s/%s/config", my_args.lxcpath[0], my_args.name);
 		if (rc == -1) {
 			SYSERROR("failed to allocate memory");
-			return 1;
+			exit(EXIT_FAILURE);
 		}
 
 		/* container configuration does not exist */
@@ -134,16 +143,16 @@ int main(int argc, char *argv[])
 	conf = lxc_conf_init();
 	if (!conf) {
 		ERROR("failed to initialize configuration");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	if (rcfile && lxc_config_read(rcfile, conf, NULL)) {
 		ERROR("failed to read configuration file");
-		return 1;
+		exit(EXIT_FAILURE);
 	}
 
 	if (lxc_config_define_load(&defines, conf))
-		return 1;
+		exit(EXIT_FAILURE);
 
 	if (my_args.uid)
 		conf->init_uid = my_args.uid;
@@ -156,6 +165,6 @@ int main(int argc, char *argv[])
 	lxc_conf_free(conf);
 
 	if (ret < 0)
-		return 1;
-	return ret;
+		exit(EXIT_FAILURE);
+	exit(EXIT_SUCCESS);
 }
